@@ -350,6 +350,7 @@ namespace MBBSEmu.HostProcess
                 //Process Channel Events
                 foreach (var session in _channelDictionary.Values)
                 {
+                    try {
                     //Process a single incoming byte from the client session
                     session.ProcessDataFromClient();
 
@@ -466,6 +467,24 @@ namespace MBBSEmu.HostProcess
 
                     //Mark Data Processing for this Channel as Complete
                     session.DataToProcess = false;
+                    } catch (System.Exception sessionEx) {
+                        // CRITICAL: a single session's exception MUST NOT kill the
+                        // entire BBS worker thread. Before this guard, any unhandled
+                        // exception in per-session code (e.g. FSD navigating off the
+                        // end of the field list, or a buggy module exit path) would
+                        // bubble all the way to the .NET runtime and terminate the
+                        // process — disconnecting EVERY user and refusing new
+                        // connections. Now we log, drop the offending session, and
+                        // keep serving the others.
+                        try {
+                            Logger.Error($"[ch={session?.Channel}] worker iter threw: {sessionEx.GetType().Name}: {sessionEx.Message}");
+                            Logger.Error(sessionEx.StackTrace ?? "(no stack)");
+                            if (session != null) {
+                                session.DataToProcess = false;
+                                session.SessionState = EnumSessionState.LoggedOff;
+                            }
+                        } catch { /* never leak from the safety net */ }
+                    }
 
                 }
 
