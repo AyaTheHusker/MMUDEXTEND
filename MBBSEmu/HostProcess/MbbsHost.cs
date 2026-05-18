@@ -575,6 +575,110 @@ namespace MBBSEmu.HostProcess
             session.InputCommand = session.InputBuffer.ToArray();
             session.InputBuffer.SetLength(0);
 
+            // Arm the room-display capture: only the FIRST rooms-file query
+            // during this dispatch is the user's current room.
+            if (session.CurrentModule?.ModuleIdentifier == "WCCMMUD")
+                HostProcess.ExportedModules.Majorbbs.CaptureNextRoomByChannel[session.Channel] = true;
+
+            // === ParaMUD-parity: `rm` interceptor (WCCMMUD only) ===
+            // Reads the live per-channel VDA and emits Location:/Regen Time:/Room Illu:
+            // in the exact ParaMUD format the MegaMUD+ walker expects.
+            //
+            // NMR's WCCUSERS record layout places MapNumber/RoomNum at byte offsets
+            // 196/200 of the user struct. The same struct is mirrored into the VDA
+            // at runtime BUT the offset within VDA where the user-struct anchor sits
+            // is unconfirmed for the 16-bit DOS build. We log a hex window so the
+            // first in-game `rm` test reveals where the real (map, room) live.
+            if (session.CurrentModule?.ModuleIdentifier == "WCCMMUD"
+                && session.InputCommand != null && session.InputCommand.Length > 0)
+            {
+                var typed = System.Text.Encoding.ASCII
+                    .GetString(session.InputCommand)
+                    .TrimEnd('\0', '\r', '\n', ' ')
+                    .Trim()
+                    .ToLowerInvariant();
+                if (typed == "rmsnap")
+                {
+                    // Memory snapshot for player-struct hunt. Dump every populated
+                    // segment of the protected-mode memory to /tmp so we can diff
+                    // between two known rooms and find which bytes hold map/room.
+                    try
+                    {
+                        int seqno;
+                        unchecked
+                        {
+                            seqno = (int)(System.DateTime.UtcNow.Ticks / 10_000_000) % 100000;
+                        }
+                        var path = $"/tmp/rmsnap_{seqno}.bin";
+                        using (var fs = System.IO.File.Create(path))
+                        using (var bw = new System.IO.BinaryWriter(fs))
+                        {
+                            var pm = session.CurrentModule?.ProtectedMemory;
+                            if (pm != null)
+                            {
+                                int dumped = 0;
+                                for (int s = 0; s <= 0xFFFF; s++)
+                                {
+                                    if (!pm.HasSegment((ushort)s)) continue;
+                                    var span = pm.VirtualToPhysical((ushort)s, 0);
+                                    bw.Write((ushort)s);
+                                    bw.Write((int)span.Length);
+                                    bw.Write(span.ToArray());
+                                    dumped++;
+                                }
+                                System.Console.Error.WriteLine($"[rmsnap] ch={session.Channel} wrote {path} ({dumped} segs)");
+                            }
+                        }
+                        session.SendToClient($"\r\n[rmsnap] saved /tmp/rmsnap_{seqno}.bin\r\n");
+                    }
+                    catch (System.Exception ex)
+                    {
+                        System.Console.Error.WriteLine($"[rmsnap] error: {ex.Message}");
+                    }
+                    session.InputCommand = new byte[] { 0 };
+                }
+                else if (typed == "rm")
+                {
+                    // Live player-struct scan. wccmmud's _MOVE_USER decompile
+                    // (Ghidra) showed:
+                    //   local_14 = _GET_PLAYER(channel, 0x1280);   // 4736 bytes
+                    //   *(int*)(local_14 + 0xC4) == current map
+                    //   *(int*)(local_14 + 0xC8) == current room
+                    // Segment number changes per session, so scan all allocated
+                    // segments for any region whose (+0xC4, +0xC8) holds a valid
+                    // (map, room) pair.
+                    int mapNum = 0, roomNum = 0;
+                    try
+                    {
+                        var pm = session.CurrentModule?.ProtectedMemory;
+                        if (pm != null)
+                        {
+                            for (int s = 0; s <= 0xFFFF; s++)
+                            {
+                                if (!pm.HasSegment((ushort)s)) continue;
+                                var span = pm.VirtualToPhysical((ushort)s, 0);
+                                if (span.Length < 0xCC) continue;
+                                int m = System.BitConverter.ToInt32(span.Slice(0xC4, 4));
+                                int r = System.BitConverter.ToInt32(span.Slice(0xC8, 4));
+                                if (m >= 1 && m <= 30 && r >= 1 && r <= 3000)
+                                {
+                                    mapNum = m; roomNum = r;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    catch { /* defensive */ }
+                    var rmResponse =
+                        $"\r\nLocation:            {mapNum},{roomNum}\r\n" +
+                        "Regen Time:            1m 30s\r\n" +
+                        "Room Illu:            -25 (50)\r\n";
+                    session.SendToClient(rmResponse);
+                    session.InputCommand = new byte[] { 0 };
+                }
+            }
+            // === end rm interceptor ===
+
             var result = Run(session.CurrentModule.ModuleIdentifier,
                 session.CurrentModule.MainModuleDll.EntryPoints["sttrou"], session.Channel);
 

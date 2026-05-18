@@ -3065,6 +3065,21 @@ namespace MBBSEmu.HostProcess.ExportedModules
             return obtainBtv(recordPointer, keyPointer, keyNumber, obtopt);
         }
 
+        // ParaMUD-parity room tracker: every time MajorMUD queries the rooms
+        // file (WCCMP001) by key, the key bytes ARE the current (map, room)
+        // the user is looking at. Cache per channel so `rm` can return it
+        // without any memory hunting.
+        //
+        // CaptureNextRoomByChannel[ch] gets set to true right before user
+        // input is dispatched. The FIRST rooms-file query during dispatch
+        // is the user's current room (the room-display lookup). Subsequent
+        // queries are background noise (neighbor "you hear movement" peeks,
+        // NPC AI scans, lairs in other maps).
+        public static readonly System.Collections.Concurrent.ConcurrentDictionary<ushort, (int Map, int Room)>
+            LastRoomByChannel = new();
+        public static readonly System.Collections.Concurrent.ConcurrentDictionary<ushort, bool>
+            CaptureNextRoomByChannel = new();
+
         private bool obtainBtv(FarPtr recordPointer, FarPtr keyPointer, int keyNumber, EnumBtrieveOperationCodes obtopt)
         {
             var currentBtrieveFile = BtrieveGetProcessor(Module.Memory.GetPointer("BB"));
@@ -3072,7 +3087,29 @@ namespace MBBSEmu.HostProcess.ExportedModules
             var keyValue = !keyPointer.IsNull() ? Module.Memory.GetArray(keyPointer, currentBtrieveFile.GetKeyLength((ushort)keyNumber)) : null;
             var result = currentBtrieveFile.PerformOperation(keyNumber, keyValue, obtopt);
             if (result)
+            {
                 UpdateBB(currentBtrieveFile, recordPointer, obtopt, (short)keyNumber);
+
+                // Tap rooms-file lookups — only capture the FIRST query per user
+                // command (the room-display). Subsequent queries are neighbor
+                // peeks / NPC scans and would clobber the real value.
+                try
+                {
+                    var path = currentBtrieveFile.FullPath ?? "";
+                    if (path.ToUpperInvariant().Contains("WCCMP001") && keyValue != null && keyValue.Length >= 8)
+                    {
+                        if (CaptureNextRoomByChannel.TryGetValue(ChannelNumber, out var armed) && armed)
+                        {
+                            var map = BitConverter.ToInt32(keyValue.Slice(0, 4));
+                            var room = BitConverter.ToInt32(keyValue.Slice(4, 4));
+                            LastRoomByChannel[ChannelNumber] = (map, room);
+                            CaptureNextRoomByChannel[ChannelNumber] = false;
+                            System.Console.Error.WriteLine($"[btv-room-first] ch={ChannelNumber} map={map} room={room}");
+                        }
+                    }
+                }
+                catch { /* defensive — never break btrieve over a debug peek */ }
+            }
 
             return result;
         }
