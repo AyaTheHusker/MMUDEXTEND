@@ -728,6 +728,23 @@ namespace MBBSEmu.HostProcess
                     session.InputCommand = new byte[] { 0 };
                     skipSttrou = true;
                 }
+                else if (typed == "share" || typed == "shar" || typed == "sha"
+                         || typed.StartsWith("share ") || typed.StartsWith("shar ")
+                         || typed.StartsWith("sha "))
+                {
+                    // MMEXTEND bug-fix: disable the `share` command to close
+                    // the long-standing encumbrance/coin exploit. Repeated
+                    // shares of large coin amounts cause a character's
+                    // encumbrance counter to roll over, letting them walk
+                    // around freely while carrying millions of coins. The
+                    // community fix is to block `share` outright (NMR/FU
+                    // Globals route); doing it at the MBBSEmu intercept
+                    // layer means no wccmmud.dll patch needed.
+                    pendingRmResponse = System.Text.Encoding.ASCII.GetBytes(
+                        "\r\nThe share command is disabled on this server.\r\n");
+                    session.InputCommand = new byte[] { 0 };
+                    skipSttrou = true;
+                }
                 else if (typed == "abil")
                 {
                     // ParaMUD-parity `abil` command. Emits rm header + Race + Class +
