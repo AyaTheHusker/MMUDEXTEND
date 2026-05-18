@@ -592,7 +592,21 @@ namespace MBBSEmu.HostProcess
 
             while (channelsToRemove.Count > 0)
             {
-                RemoveSession(channelsToRemove.Pop());
+                ushort ch = channelsToRemove.Pop();
+                try {
+                    RemoveSession(ch);
+                } catch (System.Exception ex) {
+                    // Defensive: a session whose CancellationTokenSource was
+                    // already disposed (e.g. socket abruptly torn down by
+                    // peer while in a bad state) can crash CloseSocket.
+                    // That used to take down the entire BBS — refusing new
+                    // connections forever. Now: log, force-remove from the
+                    // channel dict so we don't try again, keep serving.
+                    try {
+                        Logger.Error($"[RemoveSession ch={ch}] {ex.GetType().Name}: {ex.Message}");
+                        _channelDictionary.Remove(ch);
+                    } catch { /* never leak from safety net */ }
+                }
             }
         }
 
@@ -636,6 +650,15 @@ namespace MBBSEmu.HostProcess
             // behavior) injected our bytes mid-stream and corrupted the
             // framing of whatever wccmmud was emitting at the moment.
             byte[] pendingRmResponse = null;
+            // When we handle rm/abil/rmsnap ourselves, set this so we SKIP
+            // calling wccmmud's sttrou below. Otherwise sttrou runs with
+            // the {0} we wrote into InputCommand, and wccmmud's default
+            // behavior for empty input is to redraw the room — which
+            // gives users a duplicate room paint on every walker step
+            // (one from the move, one from our empty sttrou). The bug
+            // looks like "you're sending a bare Enter after each step"
+            // but it's actually wccmmud's reaction to no-input dispatch.
+            bool skipSttrou = false;
 
             // Arm the room-display capture: only the FIRST rooms-file query
             // during this dispatch is the user's current room.
@@ -703,6 +726,7 @@ namespace MBBSEmu.HostProcess
                         System.Console.Error.WriteLine($"[rmsnap] error: {ex.Message}");
                     }
                     session.InputCommand = new byte[] { 0 };
+                    skipSttrou = true;
                 }
                 else if (typed == "abil")
                 {
@@ -785,6 +809,7 @@ namespace MBBSEmu.HostProcess
                         System.Console.Error.WriteLine($"[abil] error: {ex.Message}");
                     }
                     session.InputCommand = new byte[] { 0 };
+                    skipSttrou = true;
                     AbilDone: ;
                 }
                 else if (typed == "rm")
@@ -950,17 +975,67 @@ namespace MBBSEmu.HostProcess
                         // Struct already shows the new room (or no move just
                         // dispatched). STAGE the reply for post-sttrou flush
                         // so framing matches a real wccmmud command response.
+                        // Append the [HP=N/MA=N] prompt so the client sees
+                        // the same response shape as any normal wccmmud
+                        // command (look, stat, direction, etc.). Without
+                        // this the client redraws the room mid-flow because
+                        // it thinks no prompt was issued.
+                        // Offsets from Ghidra _PRF_PROMPT decomp:
+                        //   +0xB0 (uint16) = current HP
+                        //   +0xBA (uint16) = current Mana
                         LastReportedLocByChannel[session.Channel] = (mapNum, roomNum);
+                        int curHp = 0, curMana = 0;
+                        // Probe candidate mana offsets — log all so user can
+                        // confirm which one matches their actual cur_mana.
+                        if (pickedSeg >= 0)
+                        {
+                            var pm2 = session.CurrentModule?.ProtectedMemory;
+                            if (pm2 != null && pm2.HasSegment((ushort)pickedSeg))
+                            {
+                                var sp = pm2.VirtualToPhysical((ushort)pickedSeg, 0);
+                                // Player struct offsets (Ghidra _PRF_PROMPT
+                                // decomp + _GET_HP_COLOUR signature):
+                                //   +0xB0  = cur HP   (uint16)
+                                //   +0x5F7 = cur Mana (uint16) — used in
+                                //           _PRF_PROMPT's spell-caster branch
+                                //           and verified against in-game value.
+                                if (sp.Length >= 0x5F9)
+                                {
+                                    curHp   = System.BitConverter.ToInt16(sp.Slice(0xB0,  2));
+                                    curMana = System.BitConverter.ToInt16(sp.Slice(0x5F7, 2));
+                                }
+                            }
+                        }
+                        // Exact prompt format captured from real wccmmud
+                        // output in vk_terminal's backscroll:
+                        //   ESC[79D ESC[K        cursor home + erase line
+                        //   ESC[0;36m[HP=        dark teal
+                        //   ESC[1;36m<curHp>     bright teal
+                        //   ESC[0;36m/MA=        dark teal
+                        //   ESC[1;36m<curMana>   bright teal
+                        //   ESC[0;36m]:          dark teal (no reset — wccmmud
+                        //                        leaves the attr active)
                         pendingRmResponse = System.Text.Encoding.ASCII.GetBytes(
                             $"\r\nLocation:            {mapNum},{roomNum}\r\n" +
                             "Regen Time:            1m 30s\r\n" +
-                            "Room Illu:            -25 (50)\r\n");
+                            "Room Illu:            -25 (50)\r\n" +
+                            "\x1b[79D\x1b[K" +
+                            $"\x1b[0;36m[HP=\x1b[1;36m{curHp}\x1b[0;36m/MA=\x1b[1;36m{curMana}\x1b[0;36m]:");
                     }
                     session.InputCommand = new byte[] { 0 };
+                    skipSttrou = true;
                 }
             }
             // === end rm interceptor ===
 
+            // Run sttrou regardless of skipSttrou (skipping breaks the
+            // session-state lifecycle). For our intercepted commands
+            // (rm/abil/rmsnap) the empty input we wrote gives wccmmud
+            // no work to do, so it returns quickly. The duplicate-room
+            // issue this used to chase is actually fixed by appending
+            // the [HP=N/MA=N] prompt to our response — the client
+            // doesn't redraw when the response is properly framed.
+            _ = skipSttrou;
             var result = Run(session.CurrentModule.ModuleIdentifier,
                 session.CurrentModule.MainModuleDll.EntryPoints["sttrou"], session.Channel);
 
