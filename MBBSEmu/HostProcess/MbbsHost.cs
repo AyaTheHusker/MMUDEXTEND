@@ -1032,12 +1032,16 @@ namespace MBBSEmu.HostProcess
                     // and `<name> says "rm"` to everyone in the room.
                     // That breaks stealth and is lethal to scripted play.
                     //
-                    // Mitigation: arm the per-channel output filter to
-                    // swallow the line containing `You say "rm"` from
-                    // THIS session's output. The room broadcast to OTHERS
-                    // is handled separately (see TODO — needs scoped
-                    // suppression on all sessions in the room).
-                    session.SuppressOutputContaining = "You say \"rm\"";
+                    // Stealth-safe path: requires the user to have
+                    // `set talk slow` enabled. In slow-talk mode the
+                    // say-prefix is `.` — typing `rm` (no leading dot)
+                    // is NOT parsed as speech, so the say-fallback
+                    // never fires and the stealth-break code path
+                    // doesn't execute. wccmmud's response is then
+                    // `Your command had no effect.` which we filter
+                    // out via the per-channel suppress hook.
+                    // No stealth break. No room broadcast. Clean.
+                    session.SuppressOutputContaining = "Your command had no effect.";
                 }
             }
             // === end rm interceptor ===
