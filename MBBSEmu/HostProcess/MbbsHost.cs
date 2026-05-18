@@ -40,6 +40,40 @@ namespace MBBSEmu.HostProcess
     /// </summary>
     public class MbbsHost : IMbbsHost, IDisposable
     {
+        // MMEXTEND: cache the player struct segment per channel so we don't
+        // get drift onto a coincidental (map, room) match in some unrelated
+        // allocation. Cleared on stale-read (struct moved or freed).
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<ushort, ushort>
+            PlayerStructSegByChannel = new();
+
+        // Last (map, room) we reported back via `rm`. Used by the smart-wait
+        // so we can detect "the previous move hasn't applied yet" and briefly
+        // poll the player struct until it changes (capped).
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<ushort, (int Map, int Room)>
+            LastReportedLocByChannel = new();
+
+        // True when the most recent typed input on this channel was a
+        // movement direction. Set by the move-input detector below; checked
+        // and cleared by the `rm` interceptor's smart-wait.
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<ushort, bool>
+            MovePendingByChannel = new();
+
+        private static bool IsMoveCommand(string typed)
+        {
+            switch (typed)
+            {
+                case "n": case "s": case "e": case "w":
+                case "ne": case "nw": case "se": case "sw":
+                case "u": case "d":
+                case "up": case "down":
+                case "north": case "south": case "east": case "west":
+                case "northeast": case "northwest":
+                case "southeast": case "southwest":
+                    return true;
+                default: return false;
+            }
+        }
+
         public IMessageLogger Logger { get; init; }
         public IClock Clock { get; init; }
 
@@ -597,6 +631,11 @@ namespace MBBSEmu.HostProcess
                     .TrimEnd('\0', '\r', '\n', ' ')
                     .Trim()
                     .ToLowerInvariant();
+                // Track when a movement command was just dispatched, so the
+                // next `rm` knows to use smart-wait (the move handler may
+                // not have updated +0xC8 yet).
+                if (IsMoveCommand(typed))
+                    MovePendingByChannel[session.Channel] = true;
                 if (typed == "rmsnap")
                 {
                     // Memory snapshot for player-struct hunt. Dump every populated
@@ -637,6 +676,88 @@ namespace MBBSEmu.HostProcess
                     }
                     session.InputCommand = new byte[] { 0 };
                 }
+                else if (typed == "abil")
+                {
+                    // ParaMUD-parity `abil` command. Emits rm header + Race + Class +
+                    // (Worn Items / Spell effects empty for now) + GrantedAbilities,
+                    // formatted as Name(ID)<pad>VALUE per line, sections separated by
+                    // blank lines.
+                    try
+                    {
+                        var pm = session.CurrentModule?.ProtectedMemory;
+                        if (pm == null) { session.InputCommand = new byte[] { 0 }; goto AbilDone; }
+
+                        // Find player struct
+                        byte[] playerStruct = null;
+                        for (int s = 0; s <= 0xFFFF; s++)
+                        {
+                            if (!pm.HasSegment((ushort)s)) continue;
+                            var span = pm.VirtualToPhysical((ushort)s, 0);
+                            if (span.Length < 0x76E) continue;
+                            int m = System.BitConverter.ToInt32(span.Slice(0xC4, 4));
+                            int r = System.BitConverter.ToInt32(span.Slice(0xC8, 4));
+                            if (m >= 1 && m <= 30 && r >= 1 && r <= 3000)
+                            {
+                                playerStruct = span.ToArray();
+                                break;
+                            }
+                        }
+                        if (playerStruct == null) { session.InputCommand = new byte[] { 0 }; goto AbilDone; }
+
+                        int mapNum = System.BitConverter.ToInt32(playerStruct, 0xC4);
+                        int roomNum = System.BitConverter.ToInt32(playerStruct, 0xC8);
+                        int raceId = System.BitConverter.ToInt16(playerStruct, 0x90);
+                        int classId = System.BitConverter.ToInt16(playerStruct, 0x92);
+
+                        var sb = new System.Text.StringBuilder();
+                        sb.Append($"\r\nLocation:            {mapNum},{roomNum}\r\n");
+                        sb.Append("Regen Time:            1m 30s\r\n");
+                        sb.Append("Room Illu:            -25 (50)\r\n");
+
+                        // Helper: format a name(id) value line, pad name+id to col 27
+                        void Emit(string name, int id, int val)
+                        {
+                            string left = $"{name}({id})";
+                            if (left.Length < 27) left = left + new string(' ', 27 - left.Length);
+                            sb.Append($"{left}{val,4}\r\n");
+                        }
+
+                        var modPath = session.CurrentModule.ModulePath;
+                        // RACE section
+                        sb.Append("Race\r\n");
+                        ReadRaceClassAbilities(System.IO.Path.Combine(modPath, "WCCRACE.DB"),
+                            raceId, /*idOff*/50, /*valOff*/72, Emit);
+                        sb.Append("\r\n");
+
+                        // CLASS section
+                        sb.Append("Class\r\n");
+                        ReadRaceClassAbilities(System.IO.Path.Combine(modPath, "WCCCLASS.DB"),
+                            classId, /*idOff*/44, /*valOff*/74, Emit);
+                        sb.Append("\r\n");
+
+                        // WORN ITEMS / SPELL EFFECTS sections (empty for v1)
+                        sb.Append("Worn Items\r\n\r\n");
+                        sb.Append("Spell effects\r\n\r\n");
+
+                        // GRANTED ABILITIES section — read +0x722 (IDs) and +0x75E (vals)
+                        sb.Append("GrantedAbilities\r\n");
+                        for (int i = 0; i < 30; i++)
+                        {
+                            short aid = System.BitConverter.ToInt16(playerStruct, 0x722 + i * 2);
+                            short aval = System.BitConverter.ToInt16(playerStruct, 0x75E + i * 2);
+                            if (aid != 0) Emit(AbilityName(aid), aid, aval);
+                        }
+                        sb.Append("\r\n");
+
+                        session.SendToClient(sb.ToString());
+                    }
+                    catch (System.Exception ex)
+                    {
+                        System.Console.Error.WriteLine($"[abil] error: {ex.Message}");
+                    }
+                    session.InputCommand = new byte[] { 0 };
+                    AbilDone: ;
+                }
                 else if (typed == "rm")
                 {
                     // Live player-struct scan. wccmmud's _MOVE_USER decompile
@@ -648,32 +769,137 @@ namespace MBBSEmu.HostProcess
                     // segments for any region whose (+0xC4, +0xC8) holds a valid
                     // (map, room) pair.
                     int mapNum = 0, roomNum = 0;
+                    int pickedSeg = -1;
+                    int matchCount = 0;
+                    // Validates a candidate segment as the player struct: must have
+                    // plausible map/room AND race(1..13)/class(1..15)/level(1..200).
+                    // Random buffers won't satisfy ALL four fields at the same offsets.
+                    static bool IsPlayerStruct(System.ReadOnlySpan<byte> span, out int m, out int r)
+                    {
+                        m = 0; r = 0;
+                        if (span.Length < 0xCC) return false;
+                        m = System.BitConverter.ToInt32(span.Slice(0xC4, 4));
+                        r = System.BitConverter.ToInt32(span.Slice(0xC8, 4));
+                        if (m < 1 || m > 30) return false;
+                        if (r < 1 || r > 3000) return false;
+                        int race = System.BitConverter.ToInt16(span.Slice(0x90, 2));
+                        int cls  = System.BitConverter.ToInt16(span.Slice(0x92, 2));
+                        int lvl  = System.BitConverter.ToInt16(span.Slice(0x94, 2));
+                        if (race < 1 || race > 13) return false;
+                        if (cls  < 1 || cls  > 15) return false;
+                        if (lvl  < 1 || lvl  > 200) return false;
+                        return true;
+                    }
                     try
                     {
                         var pm = session.CurrentModule?.ProtectedMemory;
                         if (pm != null)
                         {
-                            for (int s = 0; s <= 0xFFFF; s++)
+                            // 1) Cache hit fast path
+                            if (PlayerStructSegByChannel.TryGetValue(session.Channel, out var cachedSeg))
                             {
-                                if (!pm.HasSegment((ushort)s)) continue;
-                                var span = pm.VirtualToPhysical((ushort)s, 0);
-                                if (span.Length < 0xCC) continue;
-                                int m = System.BitConverter.ToInt32(span.Slice(0xC4, 4));
-                                int r = System.BitConverter.ToInt32(span.Slice(0xC8, 4));
-                                if (m >= 1 && m <= 30 && r >= 1 && r <= 3000)
+                                if (pm.HasSegment(cachedSeg))
                                 {
-                                    mapNum = m; roomNum = r;
-                                    break;
+                                    var cspan = pm.VirtualToPhysical(cachedSeg, 0);
+                                    if (IsPlayerStruct(cspan, out int cm, out int cr))
+                                    {
+                                        mapNum = cm; roomNum = cr; pickedSeg = cachedSeg;
+                                        matchCount = -1; // sentinel: cached
+                                    }
+                                }
+                                if (pickedSeg < 0) PlayerStructSegByChannel.TryRemove(session.Channel, out _);
+                            }
+                            // 2) Cold scan with strict validation
+                            if (pickedSeg < 0)
+                            {
+                                for (int s = 0; s <= 0xFFFF; s++)
+                                {
+                                    if (!pm.HasSegment((ushort)s)) continue;
+                                    var span = pm.VirtualToPhysical((ushort)s, 0);
+                                    if (IsPlayerStruct(span, out int m, out int r))
+                                    {
+                                        matchCount++;
+                                        if (pickedSeg < 0)
+                                        {
+                                            mapNum = m; roomNum = r; pickedSeg = s;
+                                            PlayerStructSegByChannel[session.Channel] = (ushort)s;
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                     catch { /* defensive */ }
-                    var rmResponse =
-                        $"\r\nLocation:            {mapNum},{roomNum}\r\n" +
-                        "Regen Time:            1m 30s\r\n" +
-                        "Room Illu:            -25 (50)\r\n";
-                    session.SendToClient(rmResponse);
+                    // Async smart-wait: spin up a background task that polls
+                    // the player struct off-thread (so MBBSEmu's main loop
+                    // keeps running ticks that update +0xC8). When the room
+                    // changes OR a timeout hits, emit the rm response.
+                    //
+                    // Only triggers when a move command was just dispatched
+                    // AND the current read matches the last reported (stale).
+                    // Otherwise emits immediately with current values.
+                    bool wantWait = MovePendingByChannel.TryGetValue(session.Channel, out var pending) && pending;
+                    MovePendingByChannel[session.Channel] = false;
+                    bool defer = wantWait
+                        && pickedSeg >= 0
+                        && LastReportedLocByChannel.TryGetValue(session.Channel, out var prev)
+                        && prev.Map == mapNum && prev.Room == roomNum;
+                    System.Console.Error.WriteLine(
+                        $"[rm-trace] t={System.DateTime.UtcNow:HH:mm:ss.fff} ch={session.Channel} picked=0x{pickedSeg:X4}({mapNum},{roomNum}) matches={matchCount} defer={defer}");
+                    if (defer)
+                    {
+                        var capturedPm = session.CurrentModule?.ProtectedMemory;
+                        var capturedSeg = (ushort)pickedSeg;
+                        var capturedMap = mapNum;
+                        var capturedRoom = roomNum;
+                        var capturedSession = session;
+                        var capturedChannel = session.Channel;
+                        System.Threading.Tasks.Task.Run(() =>
+                        {
+                            int m = capturedMap, r = capturedRoom;
+                            var sw = System.Diagnostics.Stopwatch.StartNew();
+                            bool settled = false;
+                            while (sw.ElapsedMilliseconds < 4500)
+                            {
+                                System.Threading.Thread.Sleep(20);
+                                if (capturedPm == null || !capturedPm.HasSegment(capturedSeg)) break;
+                                var span2 = capturedPm.VirtualToPhysical(capturedSeg, 0);
+                                if (span2.Length < 0xCC) break;
+                                int m2 = System.BitConverter.ToInt32(span2.Slice(0xC4, 4));
+                                int r2 = System.BitConverter.ToInt32(span2.Slice(0xC8, 4));
+                                if (m2 != capturedMap || r2 != capturedRoom)
+                                {
+                                    m = m2; r = r2;
+                                    settled = true;
+                                    System.Console.Error.WriteLine(
+                                        $"[rm-async] ch={capturedChannel} settled to ({m},{r}) after {sw.ElapsedMilliseconds}ms");
+                                    break;
+                                }
+                            }
+                            if (!settled)
+                                System.Console.Error.WriteLine(
+                                    $"[rm-async] ch={capturedChannel} TIMEOUT — still ({m},{r}) after {sw.ElapsedMilliseconds}ms");
+                            LastReportedLocByChannel[capturedChannel] = (m, r);
+                            var asyncResp =
+                                $"\r\nLocation:            {m},{r}\r\n" +
+                                "Regen Time:            1m 30s\r\n" +
+                                "Room Illu:            -25 (50)\r\n";
+                            try { capturedSession.SendToClient(asyncResp); }
+                            catch (System.Exception ex)
+                            {
+                                System.Console.Error.WriteLine($"[rm-async] send err: {ex.Message}");
+                            }
+                        });
+                    }
+                    else
+                    {
+                        LastReportedLocByChannel[session.Channel] = (mapNum, roomNum);
+                        var rmResponse =
+                            $"\r\nLocation:            {mapNum},{roomNum}\r\n" +
+                            "Regen Time:            1m 30s\r\n" +
+                            "Room Illu:            -25 (50)\r\n";
+                        session.SendToClient(rmResponse);
+                    }
                     session.InputCommand = new byte[] { 0 };
                 }
             }
@@ -690,6 +916,90 @@ namespace MBBSEmu.HostProcess
             if (result == 0)
                 ExitModule(session);
         }
+
+        // === MMEXTEND `abil` helpers ===
+
+        // Read race or class record by ID, decode AbilityA + AbilityB arrays, emit each.
+        private void ReadRaceClassAbilities(string dbPath, int recordId, int idArrayOff,
+            int valArrayOff, System.Action<string, int, int> emit)
+        {
+            if (!System.IO.File.Exists(dbPath)) return;
+            try
+            {
+                var connStr = $"Data Source=file:{dbPath}?mode=ro&immutable=1;Cache=Shared";
+                using var c = new Microsoft.Data.Sqlite.SqliteConnection(connStr);
+                c.Open();
+                using var cmd = c.CreateCommand();
+                cmd.CommandText = "SELECT data FROM data_t";
+                using var rdr = cmd.ExecuteReader();
+                while (rdr.Read())
+                {
+                    var rowBytes = (byte[])rdr["data"];
+                    if (rowBytes.Length < valArrayOff + 20) continue;
+                    short rid = System.BitConverter.ToInt16(rowBytes, 0);
+                    if (rid != recordId) continue;
+                    for (int i = 0; i < 10; i++)
+                    {
+                        short aid = System.BitConverter.ToInt16(rowBytes, idArrayOff + i * 2);
+                        short aval = System.BitConverter.ToInt16(rowBytes, valArrayOff + i * 2);
+                        if (aid != 0) emit(AbilityName(aid), aid, aval);
+                    }
+                    break;
+                }
+            }
+            catch (System.Exception ex)
+            {
+                System.Console.Error.WriteLine($"[abil:db] {dbPath}: {ex.Message}");
+            }
+        }
+
+        // Ability ID → name table (from MMUD-Explorer's GetAbilityName).
+        private static string AbilityName(int id) => id switch
+        {
+            1 => "Damage", 2 => "AC", 3 => "Resist-Cold", 4 => "MaxDamage",
+            5 => "Resist-Fire", 6 => "Enslave", 7 => "DR", 8 => "DrainLife",
+            9 => "Shadow", 10 => "ACBlur", 11 => "AlterEnergyLevel", 12 => "Summon",
+            13 => "Illu", 14 => "RoomIllu", 17 => "Damage(-MR)", 18 => "Heal",
+            19 => "Poison", 20 => "CurePoison", 21 => "ImmuPoison", 22 => "Accuracy",
+            23 => "AffectsUndeadOnly", 24 => "ProtEvil", 25 => "ProtGood",
+            26 => "DetectMagic", 27 => "Stealth", 28 => "Magical", 29 => "Punch",
+            30 => "Kick", 31 => "Bash", 32 => "Smash", 33 => "Killblow", 34 => "Dodge",
+            35 => "JumpKick", 36 => "M.R.", 37 => "Picklocks", 38 => "Tracking",
+            39 => "Thievery", 40 => "FindTraps", 41 => "DisarmTraps", 42 => "LearnSp",
+            43 => "CastsSp", 44 => "Intel", 45 => "Wisdom", 46 => "Strength",
+            47 => "Health", 48 => "Agility", 49 => "Charm", 51 => "AntiMagic",
+            52 => "EvilInCombat", 53 => "BlindingLight", 54 => "IlluTarget",
+            55 => "AlterLightDuration", 56 => "RechargeItem", 57 => "SeeHidden",
+            58 => "Crits", 59 => "ClassOk", 60 => "Fear", 61 => "AffectExit",
+            62 => "AlterEvilChance", 63 => "AlterExperience", 64 => "AddCP",
+            65 => "Resist-Stone", 66 => "Resist-Lightning", 67 => "Quickness",
+            68 => "Slowness", 69 => "MaxMana", 70 => "Spellcasting", 71 => "Confusion",
+            72 => "ShockShield", 73 => "DispellMagic", 74 => "HoldPerson",
+            75 => "Paralyze", 76 => "Mute", 77 => "Perception", 78 => "Animal",
+            79 => "MageBind", 80 => "AffectsAnimalsOnly", 81 => "Freedom",
+            82 => "Cursed", 83 => "CursedMajor", 84 => "RemoveCurse", 85 => "Shatter",
+            86 => "Quality", 87 => "Speed", 88 => "MaxHP", 89 => "PunchAcc",
+            90 => "KickAcc", 91 => "JumpKAcc", 92 => "PunchDmg", 93 => "KickDmg",
+            94 => "JumpKDmg", 95 => "Slay", 96 => "Encum", 97 => "GoodOnly",
+            98 => "EvilOnly", 99 => "AlterDRpercent", 100 => "LoyalItem",
+            102 => "RaceStealth", 103 => "ClassStealth", 104 => "DefenseModifier",
+            105 => "Accuracy2", 106 => "Accuracy3", 107 => "BlindUser",
+            108 => "AffectsLivingOnly", 109 => "NonLiving", 110 => "NotGood",
+            111 => "NotEvil", 112 => "NeutralOnly", 113 => "NotNeutral",
+            114 => "%Spell", 116 => "BSAccu", 117 => "BsMinDmg", 118 => "BsMaxDmg",
+            119 => "DelAtMaint", 121 => "Recharge", 122 => "RemovesSpell",
+            123 => "HPRegen", 124 => "NegateAbility", 135 => "MinLevel",
+            136 => "MaxLevel", 138 => "RoomVisible", 139 => "SpellImmu",
+            140 => "TeleportRoom", 141 => "TeleportMap", 142 => "HitMagic",
+            143 => "ClearItem", 145 => "ManaRegen", 146 => "MonsGuards",
+            147 => "Resist-Water", 148 => "TextBlock", 149 => "RemoveAtMaint",
+            150 => "HealMana", 151 => "EndCast", 152 => "Rune", 153 => "KillSpell",
+            154 => "VisibleAtMaint", 160 => "GiveTempSpell", 174 => "StealMana",
+            175 => "StealHPToMP", 176 => "StealMPtoHP", 177 => "SpellColours",
+            178 => "Shadowform", 179 => "FindTrapsValue", 180 => "PickLocksValue",
+            185 => "NoAttackIfItemNum", 186 => "PerfectStealth", 187 => "Meditate",
+            _ => $"Ability"
+        };
 
         /// <summary>
         ///     Invoked when a users STTROU returns 0, which means they're exiting
