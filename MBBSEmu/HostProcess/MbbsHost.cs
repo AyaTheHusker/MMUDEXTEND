@@ -801,7 +801,9 @@ namespace MBBSEmu.HostProcess
                         }
                         sb.Append("\r\n");
 
-                        // Defer via the same post-sttrou slot as rm.
+                        // No trailing prompt — same reasoning as rm: abil is
+                        // a silent command now and the prior tick's wccmmud
+                        // prompt already covers the screen position.
                         pendingRmResponse = System.Text.Encoding.ASCII.GetBytes(sb.ToString());
                     }
                     catch (System.Exception ex)
@@ -959,6 +961,11 @@ namespace MBBSEmu.HostProcess
                             if (settled)
                                 System.Threading.Thread.Sleep(100);
                             LastReportedLocByChannel[capturedChannel] = (m, r);
+                            // No trailing prompt: the move handler already
+                            // emitted wccmmud's real (class-appropriate)
+                            // prompt before our async fires, and the walker
+                            // filters the Location/Regen/Illu lines but not
+                            // a prompt, so adding one would double up.
                             var asyncResp =
                                 $"\r\nLocation:            {m},{r}\r\n" +
                                 "Regen Time:            1m 30s\r\n" +
@@ -984,76 +991,42 @@ namespace MBBSEmu.HostProcess
                         //   +0xB0 (uint16) = current HP
                         //   +0xBA (uint16) = current Mana
                         LastReportedLocByChannel[session.Channel] = (mapNum, roomNum);
-                        int curHp = 0, curMana = 0;
-                        // Probe candidate mana offsets — log all so user can
-                        // confirm which one matches their actual cur_mana.
-                        if (pickedSeg >= 0)
-                        {
-                            var pm2 = session.CurrentModule?.ProtectedMemory;
-                            if (pm2 != null && pm2.HasSegment((ushort)pickedSeg))
-                            {
-                                var sp = pm2.VirtualToPhysical((ushort)pickedSeg, 0);
-                                // Player struct offsets (Ghidra _PRF_PROMPT
-                                // decomp + _GET_HP_COLOUR signature):
-                                //   +0xB0  = cur HP   (uint16)
-                                //   +0x5F7 = cur Mana (uint16) — used in
-                                //           _PRF_PROMPT's spell-caster branch
-                                //           and verified against in-game value.
-                                if (sp.Length >= 0x5F9)
-                                {
-                                    curHp   = System.BitConverter.ToInt16(sp.Slice(0xB0,  2));
-                                    curMana = System.BitConverter.ToInt16(sp.Slice(0x5F7, 2));
-                                }
-                            }
-                        }
-                        // Exact prompt format captured from real wccmmud
-                        // output in vk_terminal's backscroll:
-                        //   ESC[79D ESC[K        cursor home + erase line
-                        //   ESC[0;36m[HP=        dark teal
-                        //   ESC[1;36m<curHp>     bright teal
-                        //   ESC[0;36m/MA=        dark teal
-                        //   ESC[1;36m<curMana>   bright teal
-                        //   ESC[0;36m]:          dark teal (no reset — wccmmud
-                        //                        leaves the attr active)
+                        // No trailing prompt: rm is a silent command now
+                        // (skipSttrou path), so the prior tick's wccmmud
+                        // prompt is already on screen above us. Adding our
+                        // own would double up (and would use a fixed
+                        // [HP=N/MA=N]: format that doesn't match the real
+                        // class-appropriate prompt — e.g. thieves get
+                        // [HP=N]: only).
                         pendingRmResponse = System.Text.Encoding.ASCII.GetBytes(
                             $"\r\nLocation:            {mapNum},{roomNum}\r\n" +
                             "Regen Time:            1m 30s\r\n" +
-                            "Room Illu:            -25 (50)\r\n" +
-                            "\x1b[79D\x1b[K" +
-                            $"\x1b[0;36m[HP=\x1b[1;36m{curHp}\x1b[0;36m/MA=\x1b[1;36m{curMana}\x1b[0;36m]:");
+                            "Room Illu:            -25 (50)\r\n");
                     }
-                    // DO NOT replace InputCommand. Letting wccmmud process
-                    // the raw "rm" command is what stops the duplicate-room
-                    // bug AND gives the user the natural local echo
-                    // (`[HP=...]:rm`).
-                    //
-                    // Downside: wccmmud's default for unknown commands is
-                    // `say` — it broadcasts `You say "rm"` to the player
-                    // and `<name> says "rm"` to everyone in the room.
-                    // That breaks stealth and is lethal to scripted play.
-                    //
-                    // Stealth-safe path: requires the user to have
-                    // `set talk slow` enabled. In slow-talk mode the
-                    // say-prefix is `.` — typing `rm` (no leading dot)
-                    // is NOT parsed as speech, so the say-fallback
-                    // never fires and the stealth-break code path
-                    // doesn't execute. wccmmud's response is then
-                    // `Your command had no effect.` which we filter
-                    // out via the per-channel suppress hook.
-                    // No stealth break. No room broadcast. Clean.
-                    session.SuppressOutputContaining = "Your command had no effect.";
+                    // Hand the response back ourselves and skip sttrou: wccmmud
+                    // never sees "rm", so the unknown-command → say fallback
+                    // can't fire and there's no stealth break. Chars typed
+                    // before Enter were already echoed live by wccmmud's
+                    // char-input handler, so the user already sees
+                    // `[HP=X/MA=Y]:rm` on screen; pendingRmResponse opens
+                    // with \r\n to advance past it.
+                    session.InputCommand = new byte[] { 0 };
+                    skipSttrou = true;
                 }
             }
             // === end rm interceptor ===
 
-            // Run sttrou normally. For intercepted commands the per-
-            // channel SuppressOutputContaining filter (armed above)
-            // strips just the unwanted line ("You say \"rm\"") from
-            // wccmmud's output, leaving the local echo and prompt
-            // intact.
-            _ = skipSttrou;
-            var result = Run(session.CurrentModule.ModuleIdentifier,
-                session.CurrentModule.MainModuleDll.EntryPoints["sttrou"], session.Channel);
+            // Run sttrou unless an MMEXTEND intercept handled the line
+            // itself. Skipping prevents wccmmud from running its parser
+            // on commands it doesn't know about (rm/abil/etc), which
+            // would otherwise fall through to the say-broadcast path
+            // and break stealth.
+            ushort result = 1;
+            if (!skipSttrou)
+            {
+                result = Run(session.CurrentModule.ModuleIdentifier,
+                    session.CurrentModule.MainModuleDll.EntryPoints["sttrou"], session.Channel);
+            }
 
             // Flush any deferred MMEXTEND response NOW — sttrou has already
             // returned (so wccmmud's outprf for THIS dispatch has already
