@@ -1022,19 +1022,31 @@ namespace MBBSEmu.HostProcess
                             "\x1b[79D\x1b[K" +
                             $"\x1b[0;36m[HP=\x1b[1;36m{curHp}\x1b[0;36m/MA=\x1b[1;36m{curMana}\x1b[0;36m]:");
                     }
-                    session.InputCommand = new byte[] { 0 };
-                    skipSttrou = true;
+                    // DO NOT replace InputCommand. Letting wccmmud process
+                    // the raw "rm" command is what stops the duplicate-room
+                    // bug AND gives the user the natural local echo
+                    // (`[HP=...]:rm`).
+                    //
+                    // Downside: wccmmud's default for unknown commands is
+                    // `say` — it broadcasts `You say "rm"` to the player
+                    // and `<name> says "rm"` to everyone in the room.
+                    // That breaks stealth and is lethal to scripted play.
+                    //
+                    // Mitigation: arm the per-channel output filter to
+                    // swallow the line containing `You say "rm"` from
+                    // THIS session's output. The room broadcast to OTHERS
+                    // is handled separately (see TODO — needs scoped
+                    // suppression on all sessions in the room).
+                    session.SuppressOutputContaining = "You say \"rm\"";
                 }
             }
             // === end rm interceptor ===
 
-            // Run sttrou regardless of skipSttrou (skipping breaks the
-            // session-state lifecycle). For our intercepted commands
-            // (rm/abil/rmsnap) the empty input we wrote gives wccmmud
-            // no work to do, so it returns quickly. The duplicate-room
-            // issue this used to chase is actually fixed by appending
-            // the [HP=N/MA=N] prompt to our response — the client
-            // doesn't redraw when the response is properly framed.
+            // Run sttrou normally. For intercepted commands the per-
+            // channel SuppressOutputContaining filter (armed above)
+            // strips just the unwanted line ("You say \"rm\"") from
+            // wccmmud's output, leaving the local echo and prompt
+            // intact.
             _ = skipSttrou;
             var result = Run(session.CurrentModule.ModuleIdentifier,
                 session.CurrentModule.MainModuleDll.EntryPoints["sttrou"], session.Channel);

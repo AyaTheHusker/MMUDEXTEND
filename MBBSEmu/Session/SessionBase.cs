@@ -191,6 +191,14 @@ namespace MBBSEmu.Session
         /// </summary>
         public bool OutputEnabled { get; set; }
 
+        // MMEXTEND: when set, SendToClient will scan the bytes for this
+        // substring and drop any line containing it (from the previous
+        // \r\n up through the line's terminating \r\n). One-shot — the
+        // property is cleared once a matching drop fires. Used to swallow
+        // wccmmud's "You say \"rm\"" broadcast on rm intercept without
+        // disturbing other output paths.
+        public string SuppressOutputContaining { get; set; }
+
         /// <summary>
         ///     If enabled, Status 5 is generated after output has completed
         /// </summary>
@@ -275,6 +283,35 @@ namespace MBBSEmu.Session
         public void SendToClient(byte[] dataToSend)
         {
             if (!OutputEnabled) return;
+
+            // MMEXTEND suppression: if a per-channel substring is armed,
+            // strip the LINE containing it from the bytes before sending.
+            // Used by the rm interceptor to drop wccmmud's `You say "rm"`
+            // broadcast so the user (and the room) never see it. The
+            // substring is cleared after one match so we don't blanket
+            // mute every line.
+            if (!string.IsNullOrEmpty(SuppressOutputContaining) && dataToSend != null && dataToSend.Length > 0)
+            {
+                string asText = Encoding.ASCII.GetString(dataToSend);
+                int idx = asText.IndexOf(SuppressOutputContaining, StringComparison.Ordinal);
+                if (idx >= 0)
+                {
+                    // Find the line bounds — back up to prev \n (or 0),
+                    // forward to next \n (or end).
+                    int lineStart = asText.LastIndexOf('\n', idx);
+                    if (lineStart < 0) lineStart = 0;
+                    else lineStart++;
+                    int lineEnd = asText.IndexOf('\n', idx);
+                    if (lineEnd < 0) lineEnd = asText.Length;
+                    else lineEnd++;
+                    var sb = new System.Text.StringBuilder(asText.Length);
+                    sb.Append(asText, 0, lineStart);
+                    sb.Append(asText, lineEnd, asText.Length - lineEnd);
+                    dataToSend = Encoding.ASCII.GetBytes(sb.ToString());
+                    SuppressOutputContaining = null;
+                    if (dataToSend.Length == 0) return;
+                }
+            }
 
             if (_textVariableService == null)
             {
