@@ -58,6 +58,7 @@ namespace MBBSEmu.HostProcess
         private static readonly System.Collections.Concurrent.ConcurrentDictionary<ushort, bool>
             MovePendingByChannel = new();
 
+
         private static bool IsMoveCommand(string typed)
         {
             switch (typed)
@@ -609,6 +610,14 @@ namespace MBBSEmu.HostProcess
             session.InputCommand = session.InputBuffer.ToArray();
             session.InputBuffer.SetLength(0);
 
+            // MMEXTEND command-response buffer: any rm/abil/rmsnap reply we
+            // compute below is stashed here and emitted AFTER sttrou runs,
+            // matching the slot where wccmmud's own commands flush via
+            // outprf. Emitting directly inside the interceptor (the old
+            // behavior) injected our bytes mid-stream and corrupted the
+            // framing of whatever wccmmud was emitting at the moment.
+            byte[] pendingRmResponse = null;
+
             // Arm the room-display capture: only the FIRST rooms-file query
             // during this dispatch is the user's current room.
             if (session.CurrentModule?.ModuleIdentifier == "WCCMMUD")
@@ -749,7 +758,8 @@ namespace MBBSEmu.HostProcess
                         }
                         sb.Append("\r\n");
 
-                        session.SendToClient(sb.ToString());
+                        // Defer via the same post-sttrou slot as rm.
+                        pendingRmResponse = System.Text.Encoding.ASCII.GetBytes(sb.ToString());
                     }
                     catch (System.Exception ex)
                     {
@@ -840,14 +850,26 @@ namespace MBBSEmu.HostProcess
                     // Otherwise emits immediately with current values.
                     bool wantWait = MovePendingByChannel.TryGetValue(session.Channel, out var pending) && pending;
                     MovePendingByChannel[session.Channel] = false;
-                    bool defer = wantWait
+                    bool staleMatch = wantWait
                         && pickedSeg >= 0
                         && LastReportedLocByChannel.TryGetValue(session.Channel, out var prev)
                         && prev.Map == mapNum && prev.Room == roomNum;
                     System.Console.Error.WriteLine(
-                        $"[rm-trace] t={System.DateTime.UtcNow:HH:mm:ss.fff} ch={session.Channel} picked=0x{pickedSeg:X4}({mapNum},{roomNum}) matches={matchCount} defer={defer}");
-                    if (defer)
+                        $"[rm-trace] t={System.DateTime.UtcNow:HH:mm:ss.fff} ch={session.Channel} picked=0x{pickedSeg:X4}({mapNum},{roomNum}) matches={matchCount} wantWait={wantWait} staleMatch={staleMatch}");
+
+                    if (staleMatch && pickedSeg >= 0)
                     {
+                        // Struct still on the OLD room — wccmmud's move
+                        // handler hasn't ticked yet. Wait on a BACKGROUND
+                        // thread so the dispatch loop keeps running and
+                        // wccmmud can actually update the struct. A sync
+                        // wait would deadlock: blocking ProcessSTTROU
+                        // starves the very tick that flips +0xC4/+0xC8.
+                        // When the flip is detected, send Location: via
+                        // SendToClient — by that time wccmmud's room desc
+                        // has already flushed (it goes out during the
+                        // move-handler tick that flipped the struct), so
+                        // Location: lands AFTER "Obvious exits:" naturally.
                         var capturedPm = session.CurrentModule?.ProtectedMemory;
                         var capturedSeg = (ushort)pickedSeg;
                         var capturedMap = mapNum;
@@ -861,7 +883,7 @@ namespace MBBSEmu.HostProcess
                             bool settled = false;
                             while (sw.ElapsedMilliseconds < 4500)
                             {
-                                System.Threading.Thread.Sleep(20);
+                                System.Threading.Thread.Sleep(10);
                                 if (capturedPm == null || !capturedPm.HasSegment(capturedSeg)) break;
                                 var span2 = capturedPm.VirtualToPhysical(capturedSeg, 0);
                                 if (span2.Length < 0xCC) break;
@@ -879,6 +901,19 @@ namespace MBBSEmu.HostProcess
                             if (!settled)
                                 System.Console.Error.WriteLine(
                                     $"[rm-async] ch={capturedChannel} TIMEOUT — still ({m},{r}) after {sw.ElapsedMilliseconds}ms");
+                            // Cushion: wccmmud flips the player struct at the
+                            // START of its movement tick but emits the room
+                            // description (Also here:, Obvious exits:) via
+                            // outprf a few internal cycles later. If we send
+                            // Location: the instant we detect the flip, it
+                            // can win the race into DataToClient and land
+                            // before the room block — then MegaMUD's entity
+                            // array is empty when the walker's COMBAT_WAIT
+                            // check runs, and combat doesn't fire. 100ms is
+                            // invisible inside an async wait that's already
+                            // 1+ second long.
+                            if (settled)
+                                System.Threading.Thread.Sleep(100);
                             LastReportedLocByChannel[capturedChannel] = (m, r);
                             var asyncResp =
                                 $"\r\nLocation:            {m},{r}\r\n" +
@@ -893,12 +928,14 @@ namespace MBBSEmu.HostProcess
                     }
                     else
                     {
+                        // Struct already shows the new room (or no move just
+                        // dispatched). STAGE the reply for post-sttrou flush
+                        // so framing matches a real wccmmud command response.
                         LastReportedLocByChannel[session.Channel] = (mapNum, roomNum);
-                        var rmResponse =
+                        pendingRmResponse = System.Text.Encoding.ASCII.GetBytes(
                             $"\r\nLocation:            {mapNum},{roomNum}\r\n" +
                             "Regen Time:            1m 30s\r\n" +
-                            "Room Illu:            -25 (50)\r\n";
-                        session.SendToClient(rmResponse);
+                            "Room Illu:            -25 (50)\r\n");
                     }
                     session.InputCommand = new byte[] { 0 };
                 }
@@ -907,6 +944,14 @@ namespace MBBSEmu.HostProcess
 
             var result = Run(session.CurrentModule.ModuleIdentifier,
                 session.CurrentModule.MainModuleDll.EntryPoints["sttrou"], session.Channel);
+
+            // Flush any deferred MMEXTEND response NOW — sttrou has already
+            // returned (so wccmmud's outprf for THIS dispatch has already
+            // queued whatever it was going to emit), and we're emitting
+            // before the prompt char. This is the same slot a real wccmmud
+            // command would output its response, so framing is preserved.
+            if (pendingRmResponse != null && pendingRmResponse.Length > 0)
+                session.SendToClient(pendingRmResponse);
 
             //Finally, display prompt character if one is set
             if (session.PromptCharacter > 0)
