@@ -765,7 +765,7 @@ namespace MBBSEmu.HostProcess
                             if (span.Length < 0x76E) continue;
                             int m = System.BitConverter.ToInt32(span.Slice(0xC4, 4));
                             int r = System.BitConverter.ToInt32(span.Slice(0xC8, 4));
-                            if (m >= 1 && m <= 30 && r >= 1 && r <= 3000)
+                            if (m >= 1 && m <= 30 && r >= 1 && r <= 5000)
                             {
                                 playerStruct = span.ToArray();
                                 break;
@@ -854,7 +854,10 @@ namespace MBBSEmu.HostProcess
                         m = System.BitConverter.ToInt32(span.Slice(0xC4, 4));
                         r = System.BitConverter.ToInt32(span.Slice(0xC8, 4));
                         if (m < 1 || m > 30) return false;
-                        if (r < 1 || r > 3000) return false;
+                        // Empirical max in shipped 1.11p WCCMP001 is 3463;
+                        // 5000 leaves headroom for custom areas without
+                        // matching random garbage.
+                        if (r < 1 || r > 5000) return false;
                         int race = System.BitConverter.ToInt16(span.Slice(0x90, 2));
                         int cls  = System.BitConverter.ToInt16(span.Slice(0x92, 2));
                         int lvl  = System.BitConverter.ToInt16(span.Slice(0x94, 2));
